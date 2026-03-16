@@ -1,0 +1,1280 @@
+'use strict';
+// ═══════════════════ TOKENS ═══════════════════
+const T={
+  EOF:0,EOL:1,COMMA:2,
+  FOR:0x10,TO:0x11,STEP:0x12,NEXT:0x13,
+  IF:0x14,THEN:0x15,GOTO:0x16,GOSUB:0x17,RETURN:0x18,
+  CLEAR:0x20,FILL:0x21,SET:0x22,SETHSV:0x23,
+  WAIT:0x24,DELAY:0x25,SHOW:0x26,BRIGHT:0x27,
+  VAR:0x30,NUM:0x31,
+  ASSIGN:0x40,EQ:0x41,NEQ:0x42,GT:0x43,LT:0x44,GE:0x45,LE:0x46,
+  PLUS:0x50,MINUS:0x51,MUL:0x52,DIV:0x53,MOD:0x54,AND:0x55,OR:0x56,
+  RND:0x60,ABS:0x61,MIN:0x62,MAX:0x63,SIN8:0x64,COS8:0x65,PIXEL:0x66
+};
+
+// sorted longest-first
+const KW=[
+  ['SET_HSV',T.SETHSV],['RETURN',T.RETURN],['GOSUB',T.GOSUB],
+  ['DELAY',T.DELAY],['CLEAR',T.CLEAR],['BRIGHT',T.BRIGHT],
+  ['FILL',T.FILL],['SHOW',T.SHOW],['WAIT',T.WAIT],
+  ['GOTO',T.GOTO],['NEXT',T.NEXT],['STEP',T.STEP],
+  ['THEN',T.THEN],['SET',T.SET],['FOR',T.FOR],
+  ['TO',T.TO],['IF',T.IF],
+  ['SIN8',T.SIN8],['COS8',T.COS8],['PIXEL',T.PIXEL],
+  ['RND',T.RND],['ABS',T.ABS],['MIN',T.MIN],['MAX',T.MAX],
+  ['AND',T.AND],['OR',T.OR],
+  ['==',T.EQ],['!=',T.NEQ],['>=',T.GE],['<=',T.LE],
+  ['>',T.GT],['<',T.LT],['=',T.ASSIGN],
+  ['+',T.PLUS],['-',T.MINUS],['*',T.MUL],['/',T.DIV],['%',T.MOD],[',',T.COMMA]
+];
+
+// SIN8/COS8 LUT
+const SIN8=new Uint8Array(256);
+for(let i=0;i<256;i++) SIN8[i]=Math.round(128+127*Math.sin(i*2*Math.PI/256));
+const sin8=x=>SIN8[x&255];
+const cos8=x=>SIN8[(x+64)&255];
+const clamp=v=>Math.max(0,Math.min(255,v+.5|0));
+const s16=v=>{v=v&0xFFFF;return v>=32768?v-65536:v};
+
+// ═══════════════════ COMPILER ═══════════════════
+function compileLine(raw){
+  let s=raw.trim();
+  // strip comment
+  const ci=s.indexOf("'"); if(ci>=0) s=s.slice(0,ci).trimEnd();
+  if(!s) return null;
+  let p=0;
+  function ws(){ while(p<s.length&&s[p]===' ')p++; }
+  ws();
+  // line number
+  const ns=p;
+  while(p<s.length&&s[p]>='0'&&s[p]<='9') p++;
+  if(p===ns) return{err:'Нет номера строки'};
+  const ln=parseInt(s.slice(ns,p),10);
+  if(ln<1||ln>65534) return{err:'Номер строки '+ln+' вне диапазона'};
+  ws();
+  const body=[];
+  while(p<s.length){
+    ws(); if(p>=s.length) break;
+    let hit=false;
+    for(const[w,tok] of KW){
+      if(s.substr(p,w.length)===w){
+        // word boundary check for alpha keywords
+        if(/[A-Z_]/.test(w[w.length-1])){
+          const nx=s[p+w.length];
+          if(nx&&/[A-Z0-9_]/.test(nx)) continue;
+        }
+        body.push(tok); p+=w.length; hit=true; break;
+      }
+    }
+    if(hit) continue;
+    // negative literal
+    if(s[p]==='-'&&p+1<s.length&&s[p+1]>='0'&&s[p+1]<='9'){
+      p++;
+      const q=p; while(p<s.length&&s[p]>='0'&&s[p]<='9') p++;
+      const n=s16(-parseInt(s.slice(q,p),10));
+      body.push(T.NUM,(n>>8)&255,n&255); continue;
+    }
+    // positive literal
+    if(s[p]>='0'&&s[p]<='9'){
+      const q=p; while(p<s.length&&s[p]>='0'&&s[p]<='9') p++;
+      const n=s16(parseInt(s.slice(q,p),10));
+      body.push(T.NUM,(n>>8)&255,n&255); continue;
+    }
+    // variable A-Z (single letter only)
+    if(s[p]>='A'&&s[p]<='Z'){
+      const nx=s[p+1];
+      if(!nx||!/[A-Z0-9_]/.test(nx)){
+        body.push(T.VAR, s.charCodeAt(p)-65); p++; continue;
+      }
+    }
+    return{err:'Неизвестный токен: "'+s.slice(p,p+8)+'"'};
+  }
+  body.push(T.EOL);
+  return{ln, bytes:[(ln>>8)&255, ln&255, body.length, ...body]};
+}
+
+// Split one text line into logical BASIC lines.
+// "10 A=0  11 B=1  12 GOTO 10" → ["10 A=0", "11 B=1", "12 GOTO 10"]
+// A new logical line starts where whitespace is followed by a run of digits
+// and then a space/end, AND those digits form a number >= the previous one.
+function splitLogicalLines(raw){
+  // Strip comment first (apostrophe)
+  const ci=raw.indexOf("'"); 
+  const code = ci>=0 ? raw.slice(0,ci) : raw;
+  const comment = ci>=0 ? raw.slice(ci) : '';
+  const s=code.trimEnd();
+  if(!s) return raw ? [raw] : [];
+
+  // Find all positions where a new line number starts:
+  // position is after whitespace, digits follow, then whitespace or end
+  const cuts=[0];
+  // regex: two+ spaces then digits then space (potential line number boundary)
+  const re=/\s{2,}(\d+)(?=\s)/g;
+  let m;
+  while((m=re.exec(s))!==null){
+    const num=parseInt(m[1],10);
+    // only cut if number is reasonable (1..65534)
+    if(num>=1&&num<=65534) cuts.push(m.index+m[0].length-m[1].length);
+  }
+
+  if(cuts.length===1){
+    // single logical line — reattach comment to last segment
+    return [s + (comment?' '+comment.trim():'')];
+  }
+
+  const result=[];
+  for(let i=0;i<cuts.length;i++){
+    const seg=s.slice(cuts[i], cuts[i+1]!==undefined ? cuts[i+1] : s.length).trim();
+    if(!seg) continue;
+    // attach comment only to last segment
+    result.push(i===cuts.length-1 ? seg+(comment?' '+comment.trim():'') : seg);
+  }
+  return result;
+}
+
+function compile(text){
+  const lines=text.split('\n');
+  const all=[], errs=[], lmap={};
+  for(let i=0;i<lines.length;i++){
+    const raw=lines[i].trim();
+    if(!raw||raw[0]==="'") continue;
+    // split multi-statement lines: "10 X=0  11 Y=1" → two logical lines
+    const logical=splitLogicalLines(raw);
+    for(const seg of logical){
+      if(!seg||seg[0]==="'") continue;
+      const r=compileLine(seg);
+      if(!r) continue;
+      if(r.err){ errs.push({line:i+1,msg:r.err,type:'error'}); continue; }
+      if(lmap[r.ln]!==undefined)
+        errs.push({line:i+1,msg:'Дубль строки '+r.ln,type:'warn'});
+      lmap[r.ln]=i;
+      for(const b of r.bytes) all.push(b);
+    }
+  }
+  all.push(0,0); // EOF marker
+  return{bytes:new Uint8Array(all), errs};
+}
+
+// ═══════════════════ DECOMPILER ═══════════════════
+const TNAME={};
+for(const[k,v] of Object.entries(T)) TNAME[v]=k.replace('SETHSV','SET_HSV');
+
+function decompile(bytes){
+  const out=[]; let pc=0;
+  while(pc+2<bytes.length){
+    const hi=bytes[pc],lo=bytes[pc+1];
+    if(!hi&&!lo) break;
+    const ln=(hi<<8)|lo, len=bytes[pc+2];
+    pc+=3;
+    const end=pc+len, toks=[];
+    while(pc<end){
+      const b=bytes[pc++];
+      if(b===T.EOL) break;
+      if(b===T.VAR){ toks.push(String.fromCharCode(65+bytes[pc++])); continue; }
+      if(b===T.NUM){ let v=(bytes[pc]<<8)|bytes[pc+1]; pc+=2; if(v>=32768)v-=65536; toks.push(''+v); continue; }
+      if(b===T.COMMA){ toks.push(','); continue; }
+      const n=TNAME[b]; if(n) toks.push(n);
+    }
+    pc=end;
+    out.push(ln+' '+toks.join(' '));
+  }
+  return out.join('\n');
+}
+
+// ═══════════════════ VM ═══════════════════
+class VM{
+  constructor(bytes,n,onPx,onShow,onClear){
+    this.b=bytes; this.n=n;
+    this.onPx=onPx; this.onShow=onShow; this.onClear=onClear;
+    this.vars=new Int16Array(26);
+    this.cstack=[]; this.fstack=[];
+    this.pc=0; this.state='stop'; this.wu=0; this.speed=100;
+    // build line index: lineNum -> bodyStart
+    this.idx={}; let pp=0;
+    while(pp+2<bytes.length){
+      const hi=bytes[pp],lo=bytes[pp+1];
+      if(!hi&&!lo) break;
+      this.idx[(hi<<8)|lo]=pp+3;
+      pp+=3+bytes[pp+2];
+    }
+    // sorted line numbers for sequential execution
+    this.lineNums=Object.keys(this.idx).map(Number).sort((a,b)=>a-b);
+    // bodyEnd: lineNum -> one past last byte of body (including EOL)
+    this.bodyEnd={};
+    pp=0;
+    while(pp+2<bytes.length){
+      const hi=bytes[pp],lo=bytes[pp+1];
+      if(!hi&&!lo) break;
+      const ln=(hi<<8)|lo, len=bytes[pp+2];
+      this.bodyEnd[ln]=pp+3+len;
+      pp+=3+len;
+    }
+  }
+
+  play(){
+    this.vars.fill(0); this.cstack=[]; this.fstack=[];
+    if(!this.lineNums.length){this.state='stop';return;}
+    this.curLine=0; // index into lineNums
+    this.pc=this.idx[this.lineNums[0]];
+    this.state='run';
+  }
+
+  stop(){ this.state='stop'; this.onClear(); }
+  setSpeed(s){ this.speed=Math.max(1,Math.min(1000,s)); }
+  asp(ms){ return ms<=0?0:Math.round(ms*100/this.speed); }
+
+  // fetch one byte
+  f(){ return this.b[this.pc++]; }
+  // fetch int16 big-endian
+  i16(){ let v=(this.b[this.pc]<<8)|this.b[this.pc+1]; this.pc+=2; return v>=32768?v-65536:v; }
+
+  // find body start for a line number
+  line(n){ return this.idx[n]; }
+
+  // skip to end of current line body (past EOL), advance curLine
+  skipLine(){
+    const ln=this.lineNums[this.curLine];
+    if(ln!==undefined) this.pc=this.bodyEnd[ln];
+    this.advanceLine();
+  }
+
+  // move to next sequential line
+  advanceLine(){
+    this.curLine++;
+    if(this.curLine>=this.lineNums.length){ this.state='stop'; return; }
+    this.pc=this.idx[this.lineNums[this.curLine]];
+  }
+
+  // jump to a line number (for GOTO/GOSUB)
+  jumpTo(ln){
+    const bp=this.line(ln);
+    if(bp===undefined){ this.state='stop'; return false; }
+    // find curLine index
+    const idx=this.lineNums.indexOf(ln);
+    if(idx<0){ this.state='stop'; return false; }
+    this.curLine=idx;
+    this.pc=bp;
+    return true;
+  }
+
+  // scan past EOL token in body (used inside IF THEN to skip rest of line)
+  scanToEOL(){
+    while(this.pc<this.b.length){
+      const b=this.b[this.pc];
+      if(b===T.EOL){ this.pc++; return; }
+      if(b===T.NUM){ this.pc+=3; continue; }
+      if(b===T.VAR){ this.pc+=2; continue; }
+      this.pc++;
+    }
+  }
+
+  // expression evaluator
+  expr(){ return this.addSub(); }
+  addSub(){
+    let v=this.mulDiv();
+    for(;;){
+      const op=this.b[this.pc];
+      if(op===T.PLUS){  this.pc++; v=s16(v+this.mulDiv()); }
+      else if(op===T.MINUS){ this.pc++; v=s16(v-this.mulDiv()); }
+      else if(op===T.AND){  this.pc++; v=s16(v&this.mulDiv()); }
+      else if(op===T.OR){   this.pc++; v=s16(v|this.mulDiv()); }
+      else break;
+    }
+    return v;
+  }
+  mulDiv(){
+    let v=this.unary();
+    for(;;){
+      const op=this.b[this.pc];
+      if(op===T.MUL){ this.pc++; v=s16(v*this.unary()); }
+      else if(op===T.DIV){ this.pc++; const d=this.unary(); v=d?s16(Math.trunc(v/d)):0; }
+      else if(op===T.MOD){ this.pc++; const d=this.unary(); v=d?s16(v%d):0; }
+      else break;
+    }
+    return v;
+  }
+  unary(){
+    if(this.b[this.pc]===T.MINUS){ this.pc++; return s16(-this.primary()); }
+    return this.primary();
+  }
+  primary(){
+    const op=this.f();
+    if(op===T.NUM)  return this.i16();
+    if(op===T.VAR)  return this.vars[this.f()];
+    if(op===T.RND){ const a=this.expr(); this.f()/*COMMA*/; const b=this.expr(); return s16(a+Math.floor(Math.random()*(b-a+1))); }
+    if(op===T.ABS)  return s16(Math.abs(this.expr()));
+    if(op===T.MIN){ const a=this.expr(); this.f(); const b=this.expr(); return s16(Math.min(a,b)); }
+    if(op===T.MAX){ const a=this.expr(); this.f(); const b=this.expr(); return s16(Math.max(a,b)); }
+    if(op===T.SIN8) return s16(sin8(this.expr()&255));
+    if(op===T.COS8) return s16(cos8(this.expr()&255));
+    if(op===T.PIXEL) return s16(this.n-1);
+    return 0;
+  }
+
+  hsv(h,s,v){
+    h=((h%256)+256)%256; s=clamp(s); v=clamp(v);
+    if(!s) return[v,v,v];
+    const reg=h/43|0, rem=(h-reg*43)*6;
+    const p=v*(255-s)/255+.5|0;
+    const q=v*(255-(s*rem>>8))/255+.5|0;
+    const t=v*(255-(s*(255-rem)>>8))/255+.5|0;
+    switch(reg%6){case 0:return[v,t,p];case 1:return[q,v,p];case 2:return[p,v,t];case 3:return[p,q,v];case 4:return[t,p,v];default:return[v,p,q];}
+  }
+
+  // execute one statement from current pc, return 'yield' if WAIT/DELAY
+  execStmt(){
+    const op=this.f();
+    switch(op){
+      case T.EOL: this.advanceLine(); return 'next';
+      case T.EOF: this.state='stop'; return 'stop';
+
+      case T.VAR:{
+        const vi=this.f(); this.f()/*ASSIGN*/; this.vars[vi]=s16(this.expr());
+        break;
+      }
+      case T.SET:{
+        const pos=this.expr(); this.f()/*,*/;
+        const r=this.expr(); this.f()/*,*/;
+        const g=this.expr(); this.f()/*,*/;
+        const bv=this.expr();
+        if(pos>=0&&pos<this.n) this.onPx(pos,clamp(r),clamp(g),clamp(bv));
+        break;
+      }
+      case T.SETHSV:{
+        const pos=this.expr(); this.f();
+        const h=this.expr(); this.f();
+        const sv=this.expr(); this.f();
+        const v=this.expr();
+        if(pos>=0&&pos<this.n){const[r,g,b]=this.hsv(h,sv,v);this.onPx(pos,r,g,b);}
+        break;
+      }
+      case T.CLEAR: this.onClear(); break;
+      case T.FILL:{
+        const r=this.expr(); this.f();
+        const g=this.expr(); this.f();
+        const bv=this.expr();
+        for(let i=0;i<this.n;i++) this.onPx(i,clamp(r),clamp(g),clamp(bv));
+        break;
+      }
+      case T.SHOW: this.onShow(); break;
+      case T.WAIT:{
+        const ms=this.expr();
+        this.onShow();
+        this.wu=Date.now()+this.asp(ms);
+        this.state='wait';
+        return 'yield';
+      }
+      case T.DELAY:{
+        const ms=this.expr();
+        this.wu=Date.now()+this.asp(ms);
+        this.state='wait';
+        return 'yield';
+      }
+      case T.GOTO:{
+        const ln=this.expr();
+        this.jumpTo(ln);
+        return 'next';
+      }
+      case T.GOSUB:{
+        const ln=this.expr();
+        if(this.cstack.length<10){
+          // save return: next sequential line after current
+          this.cstack.push({curLine:this.curLine, pc:this.pc});
+          // skip rest of current line body
+          this.scanToEOL();
+          this.jumpTo(ln);
+        }
+        return 'next';
+      }
+      case T.RETURN:{
+        if(this.cstack.length){
+          const ret=this.cstack.pop();
+          this.curLine=ret.curLine;
+          this.pc=ret.pc;
+          // skip to end of the GOSUB line (after return we continue after the GOSUB line)
+          this.scanToEOL();
+          this.advanceLine();
+        } else this.state='stop';
+        return 'next';
+      }
+      case T.FOR:{
+        this.f()/*VAR*/; const vi=this.f();
+        this.f()/*ASSIGN*/; const sv=s16(this.expr());
+        this.vars[vi]=sv;
+        this.f()/*TO*/; const ev=s16(this.expr());
+        let stv=1;
+        if(this.b[this.pc]===T.STEP){ this.f(); stv=s16(this.expr()); }
+        // skip EOL, advance to next line (body of loop)
+        this.scanToEOL();
+        this.advanceLine();
+        this.fstack.push({vi,ev,stv,curLine:this.curLine,pc:this.pc});
+        return 'next';
+      }
+      case T.NEXT:{
+        this.f()/*VAR*/; const vi=this.f();
+        if(!this.fstack.length) break;
+        const fr=this.fstack[this.fstack.length-1];
+        this.vars[fr.vi]=s16(this.vars[fr.vi]+fr.stv);
+        const cont=fr.stv>=0?this.vars[fr.vi]<=fr.ev:this.vars[fr.vi]>=fr.ev;
+        if(cont){ this.curLine=fr.curLine; this.pc=fr.pc; }
+        else this.fstack.pop();
+        return 'next';
+      }
+      case T.IF:{
+        const lv=this.expr();
+        const rop=this.f();
+        const rv=this.expr();
+        if(this.b[this.pc]===T.THEN) this.f();
+        let cond=false;
+        switch(rop){
+          case T.EQ:cond=lv===rv;break; case T.NEQ:cond=lv!==rv;break;
+          case T.GT:cond=lv>rv;break;   case T.LT:cond=lv<rv;break;
+          case T.GE:cond=lv>=rv;break;  case T.LE:cond=lv<=rv;break;
+        }
+        if(cond){
+          const r=this.execThen();
+          if(r!=='jumped'){ this.scanToEOL(); this.advanceLine(); }
+          return 'next';
+        } else {
+          this.scanToEOL(); this.advanceLine();
+        }
+        return 'next';
+      }
+      case T.BRIGHT: this.expr(); break;
+      default: break;
+    }
+    return 'ok';
+  }
+
+  execThen(){
+    const op=this.f();
+    switch(op){
+      case T.VAR:{
+        const vi=this.f(); this.f()/*ASSIGN*/; this.vars[vi]=s16(this.expr()); break;
+      }
+      case T.SET:{
+        const pos=this.expr(); this.f();
+        const r=this.expr(); this.f();
+        const g=this.expr(); this.f();
+        const bv=this.expr();
+        if(pos>=0&&pos<this.n) this.onPx(pos,clamp(r),clamp(g),clamp(bv));
+        break;
+      }
+      case T.SETHSV:{
+        const pos=this.expr(); this.f();
+        const h=this.expr(); this.f();
+        const sv=this.expr(); this.f();
+        const v=this.expr();
+        if(pos>=0&&pos<this.n){const[r,g,b]=this.hsv(h,sv,v);this.onPx(pos,r,g,b);}
+        break;
+      }
+      case T.GOTO:{
+        const ln=this.expr(); this.jumpTo(ln); return 'jumped';
+      }
+      case T.GOSUB:{
+        const ln=this.expr();
+        if(this.cstack.length<10){
+          this.cstack.push({curLine:this.curLine,pc:this.pc});
+          this.scanToEOL();
+          this.jumpTo(ln);
+        }
+        return 'jumped';
+      }
+      case T.RETURN:{
+        if(this.cstack.length){
+          const ret=this.cstack.pop();
+          this.curLine=ret.curLine; this.pc=ret.pc;
+          this.scanToEOL(); this.advanceLine();
+        } else this.state='stop';
+        return 'jumped';
+      }
+    }
+    return 'ok';
+  }
+
+  step(){
+    if(this.state==='stop') return false;
+    if(this.state==='wait'){
+      if(Date.now()>=this.wu) this.state='run';
+      else return true;
+    }
+    let budget=2000;
+    while(this.state==='run'&&budget-->0){
+      const r=this.execStmt();
+      if(r==='yield'||r==='stop') return r==='yield';
+    }
+    return false;
+  }
+}
+
+// ═══════════════════ EMULATOR ═══════════════════
+const ecanv=document.getElementById('ecanv');
+const ectx=ecanv.getContext('2d');
+let epx=null;
+let cfg={fs:13,tab:2,ac:true,ns:10,nst:10,speed:100,brightness:255,expMode:'cs'};
+
+function onShapeChange(){
+  const shape=document.getElementById('eshape').value;
+  const isMat=shape==='matrix';
+  document.getElementById('row-px').style.display=isMat?'none':'flex';
+  document.getElementById('row-mw').style.display=isMat?'flex':'none';
+  document.getElementById('row-mh').style.display=isMat?'flex':'none';
+  resizeEmu();
+}
+
+function getEmuParams(){
+  const shape=document.getElementById('eshape').value;
+  const sc=+document.getElementById('escale').value||11;
+  let n,cols,rows;
+  if(shape==='matrix'){
+    cols=+document.getElementById('emw').value||16;
+    rows=+document.getElementById('emh').value||16;
+    n=cols*rows;
+  } else {
+    n=+document.getElementById('ec').value||32;
+    cols=n; rows=1;
+  }
+  return{shape,sc,n,cols,rows};
+}
+
+function resizeEmu(){
+  const{shape,sc,n,cols,rows}=getEmuParams();
+  epx=new Uint8Array(n*3);
+  if(shape==='strip'){ ecanv.width=n*sc; ecanv.height=sc; }
+  else if(shape==='ring'){
+    const r=Math.max(n*sc/(2*Math.PI),sc*2);
+    ecanv.width=ecanv.height=Math.ceil(r*2+sc*2);
+  } else {
+    ecanv.width=cols*sc; ecanv.height=rows*sc;
+  }
+  drawEmu();
+}
+
+function drawEmu(){
+  const{shape,sc,n,cols}=getEmuParams();
+  const br=cfg.brightness/255;
+  const px=epx||new Uint8Array(n*3);
+  ectx.clearRect(0,0,ecanv.width,ecanv.height);
+  ectx.fillStyle='#070910'; ectx.fillRect(0,0,ecanv.width,ecanv.height);
+  const r=(sc-Math.max(1,sc*0.12|0)*2)/2;
+  for(let i=0;i<n;i++){
+    const ri=px[i*3]*br+.5|0, gi=px[i*3+1]*br+.5|0, bi=px[i*3+2]*br+.5|0;
+    let x,y;
+    if(shape==='strip'){ x=i*sc+sc/2; y=sc/2; }
+    else if(shape==='ring'){
+      const ang=(i/n)*2*Math.PI-Math.PI/2;
+      const rad=ecanv.width/2-sc;
+      x=ecanv.width/2+rad*Math.cos(ang); y=ecanv.height/2+rad*Math.sin(ang);
+    } else {
+      x=(i%cols)*sc+sc/2; y=(i/cols|0)*sc+sc/2;
+    }
+    if(ri+gi+bi>6){
+      const g=ectx.createRadialGradient(x,y,0,x,y,r*2.4);
+      g.addColorStop(0,`rgba(${ri},${gi},${bi},0.4)`);
+      g.addColorStop(1,'rgba(0,0,0,0)');
+      ectx.fillStyle=g; ectx.beginPath(); ectx.arc(x,y,r*2.4,0,Math.PI*2); ectx.fill();
+    }
+    ectx.beginPath(); ectx.arc(x,y,r,0,Math.PI*2);
+    ectx.fillStyle=`rgb(${ri},${gi},${bi})`; ectx.fill();
+    ectx.strokeStyle='rgba(255,255,255,0.07)'; ectx.lineWidth=0.5; ectx.stroke();
+  }
+}
+
+// ═══════════════════ EDITOR ═══════════════════
+const ta=document.getElementById('ta');
+const hlayer=document.getElementById('hlayer');
+const gutterInner=document.getElementById('gutter-inner');
+const escroll=document.getElementById('escroll');
+const einner=document.getElementById('einner');
+const curhl=document.getElementById('curhl');
+
+let code='', errs=[], lintTimer=null;
+
+// ── Sync textarea size with content ──
+function syncSize(){
+  // make einner tall enough so scrollbar appears on escroll, not ta
+  const lines=code.split('\n');
+  const lh=cfg.fs*1.6;
+  const h=Math.max(escroll.clientHeight, lines.length*lh+20);
+  const w=Math.max(escroll.clientWidth, Math.max(...lines.map(l=>l.length))*cfg.fs*0.6+30);
+  einner.style.height=h+'px';
+  einner.style.width=w+'px';
+  ta.style.height=h+'px';
+  ta.style.width=w+'px';
+  hlayer.style.width=w+'px';
+}
+
+// ── Highlight ──
+const LED_KW=new Set(['CLEAR','FILL','SET_HSV','SET','WAIT','DELAY','SHOW','BRIGHT']);
+const FLOW_KW=new Set(['FOR','TO','STEP','NEXT','IF','THEN','GOTO','GOSUB','RETURN']);
+const FN_KW=new Set(['RND','ABS','MIN','MAX','SIN8','COS8','AND','OR','PIXEL']);
+
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function hlLine(raw, hasErr, hasWrn){
+  let s=raw, out='';
+  // comment
+  const ci=s.indexOf("'");
+  let cmt='';
+  if(ci>=0){ cmt=s.slice(ci); s=s.slice(0,ci); }
+
+  // Split into logical sub-lines for highlighting (multi-statement support)
+  // Each logical segment starts with a line number
+  const segs = splitLogicalLines(s + (cmt ? "'"+cmt.slice(1) : ''));
+  // if only one segment, process normally; if multiple, highlight each separately
+  const renderSeg = (seg) => {
+    let t=seg, res='';
+    // strip comment from this segment
+    const sc=t.indexOf("'"); let sc_str='';
+    if(sc>=0){ sc_str=t.slice(sc); t=t.slice(0,sc); }
+    // line number
+    const nm=t.match(/^(\s*)(\d+)(.*)/);
+    if(nm){ res+=`<span class="kx">${esc(nm[1]+nm[2])}</span>`; t=nm[3]; }
+    // tokenize
+    let p=0;
+    while(p<t.length){
+      if(t[p]===' '){ let w=''; while(p<t.length&&t[p]===' ') w+=t[p++]; res+=esc(w); continue; }
+      const rem=t.slice(p);
+      let hit=false;
+      for(const[w,] of KW){
+        if(rem.startsWith(w)){
+          if(/[A-Z_]/.test(w[w.length-1])){
+            const nx=t[p+w.length]; if(nx&&/[A-Z0-9_]/.test(nx)) continue;
+          }
+          const cls=LED_KW.has(w)?'kc':FLOW_KW.has(w)?'kf':FN_KW.has(w)?'kn':'ko';
+          res+=`<span class="${cls}">${esc(w)}</span>`;
+          p+=w.length; hit=true; break;
+        }
+      }
+      if(hit) continue;
+      if((t[p]==='-'&&p+1<t.length&&t[p+1]>='0'&&t[p+1]<='9')||(t[p]>='0'&&t[p]<='9')){
+        let n=''; if(t[p]==='-') n+=t[p++];
+        while(p<t.length&&t[p]>='0'&&t[p]<='9') n+=t[p++];
+        res+=`<span class="km">${esc(n)}</span>`; continue;
+      }
+      if(t[p]>='A'&&t[p]<='Z'){
+        const nx=t[p+1];
+        if(!nx||!/[A-Z0-9_]/.test(nx)){
+          res+=`<span class="kv">${t[p]}</span>`; p++; continue;
+        }
+      }
+      res+=esc(t[p++]);
+    }
+    if(sc_str) res+=`<span class="kx">${esc(sc_str)}</span>`;
+    return res;
+  };
+
+  if(segs.length<=1){
+    out = renderSeg(s + (cmt ? cmt : ''));
+  } else {
+    // multiple logical lines on one text line — render each, separate with dim marker
+    out = segs.map((seg,i) =>
+      renderSeg(seg) + (i<segs.length-1 ? '<span style="opacity:.35">  </span>' : '')
+    ).join('');
+  }
+
+  if(hasErr) return `<span class="kerr">${out}</span>`;
+  if(hasWrn) return `<span class="kwrn">${out}</span>`;
+  return out;
+}
+
+function updateHL(){
+  const lines=code.split('\n');
+  const byLine={};
+  errs.forEach(e=>{ if(!byLine[e.line]) byLine[e.line]=[]; byLine[e.line].push(e); });
+  hlayer.innerHTML=lines.map((l,i)=>{
+    const ee=byLine[i+1];
+    const hasE=ee&&ee.some(x=>x.type==='error');
+    const hasW=ee&&!hasE;
+    return hlLine(l,hasE,hasW);
+  }).join('\n');
+}
+
+function updateGutter(){
+  const lines=code.split('\n');
+  const byLine={};
+  errs.forEach(e=>{ if(!byLine[e.line]) byLine[e.line]=[]; byLine[e.line].push(e); });
+  const lh=cfg.fs*1.6;
+  gutterInner.innerHTML=lines.map((l,i)=>{
+    const n=i+1;
+    const ee=byLine[n];
+    const cls='gln'+(ee?(ee.some(x=>x.type==='error')?' err':' wrn'):'');
+    const tt=ee?ee.map(x=>x.msg).join('; '):'';
+    return `<div class="${cls}" style="height:${lh}px;line-height:${lh}px" title="${esc(tt)}" onclick="goLine(${n})">${n}</div>`;
+  }).join('');
+}
+
+function updateErrStatus(){
+  const n=errs.filter(e=>e.type==='error').length;
+  const el=document.getElementById('st-err');
+  document.getElementById('st-ec').textContent=n;
+  el.style.display=n?'':'none';
+}
+
+// ── lint ──
+function lint(text){
+  const lines=text.split('\n');
+  const out=[], seen=new Set();
+  for(let i=0;i<lines.length;i++){
+    const raw=lines[i].trim();
+    if(!raw||raw[0]==="'") continue;
+    const r=compileLine(raw);
+    if(!r) continue;
+    if(r.err){ out.push({line:i+1,msg:r.err,type:'error'}); continue; }
+    if(seen.has(r.ln)) out.push({line:i+1,msg:'Дубль строки '+r.ln,type:'warn'});
+    seen.add(r.ln);
+  }
+  return out;
+}
+
+// ── cursor / selection ──
+let curRow=1;
+function onSelChange(){
+  const pos=ta.selectionStart;
+  const before=code.slice(0,pos);
+  const ls=before.split('\n');
+  curRow=ls.length;
+  const col=ls[ls.length-1].length+1;
+  document.getElementById('st-pos').textContent=`Стр ${curRow}, Кол ${col}`;
+  document.getElementById('st-ln').textContent=code.split('\n').length+' строк';
+
+  const lh=cfg.fs*1.6;
+  curhl.style.top=(10+(curRow-1)*lh)+'px';
+  curhl.style.height=lh+'px';
+
+  // sync gutter active line
+  gutterInner.querySelectorAll('.gln').forEach((el,i)=>{
+    el.classList.toggle('cur',i+1===curRow);
+  });
+
+  // error tooltip
+  const ee=errs.filter(e=>e.line===curRow);
+  const tip=document.getElementById('errtip');
+  if(ee.length){
+    tip.textContent=ee.map(e=>e.msg).join('\n');
+    tip.style.display='block';
+    const rect=ta.getBoundingClientRect();
+    const scrollTop=escroll.scrollTop;
+    tip.style.left=(rect.left+50)+'px';
+    tip.style.top=(rect.top+(curRow-1)*lh-scrollTop+lh+8)+'px';
+  } else tip.style.display='none';
+}
+
+function onScroll(){
+  const st=escroll.scrollTop, sl=escroll.scrollLeft;
+  // sync gutter vertical scroll
+  gutterInner.style.top=(-st)+'px';
+  // sync highlight layer (it's already absolutely positioned inside einner which scrolls)
+  // ta scrolls with escroll, hlayer is sibling — both inside einner, no transform needed
+  // just keep gutter in sync
+}
+
+function onInput(){
+  code=ta.value;
+  document.getElementById('tab-dirty').style.display='';
+  syncSize();
+  updateHL();
+  updateGutter();
+  clearTimeout(lintTimer);
+  lintTimer=setTimeout(()=>{
+    errs=lint(code);
+    updateHL();
+    updateGutter();
+    updateErrStatus();
+  },300);
+  onSelChange();
+}
+
+function goLine(n){
+  const ls=code.split('\n');
+  let pos=0;
+  for(let i=0;i<Math.min(n-1,ls.length);i++) pos+=ls[i].length+1;
+  ta.focus(); ta.setSelectionRange(pos,pos);
+  onSelChange();
+  // scroll to line
+  const lh=cfg.fs*1.6;
+  escroll.scrollTop=Math.max(0,(n-3)*lh);
+}
+
+// ── keyboard ──
+const acEl=document.getElementById('acp');
+const ACL=[
+  {l:'FOR',t:'flow',s:'FOR  = 0 TO 31'},{l:'NEXT',t:'flow',s:'NEXT '},
+  {l:'IF',t:'flow',s:'IF  THEN '},{l:'GOTO',t:'flow',s:'GOTO '},
+  {l:'GOSUB',t:'flow',s:'GOSUB '},{l:'RETURN',t:'flow',s:'RETURN'},
+  {l:'SET_HSV',t:'led',s:'SET_HSV  , 0 , 255 , 200'},
+  {l:'SET',t:'led',s:'SET  , 255 , 0 , 0'},
+  {l:'FILL',t:'led',s:'FILL 255 , 0 , 0'},
+  {l:'CLEAR',t:'led',s:'CLEAR'},
+  {l:'WAIT',t:'led',s:'WAIT 20'},
+  {l:'DELAY',t:'led',s:'DELAY 500'},
+  {l:'SHOW',t:'led',s:'SHOW'},
+  {l:'RND',t:'fn',s:'RND 0 , 255'},
+  {l:'ABS',t:'fn',s:'ABS '},
+  {l:'SIN8',t:'fn',s:'SIN8 '},
+  {l:'COS8',t:'fn',s:'COS8 '},
+  {l:'MIN',t:'fn',s:'MIN  , '},
+  {l:'MAX',t:'fn',s:'MAX  , '},
+  {l:'PIXEL',t:'fn',s:'PIXEL'},
+];
+let acItems=[], acSel=0;
+
+function showAC(){
+  if(!cfg.ac) return;
+  const pos=ta.selectionStart;
+  const before=code.slice(0,pos);
+  const m=before.match(/([A-Z_]{2,})$/);
+  if(!m){ hideAC(); return; }
+  const word=m[1];
+  acItems=ACL.filter(a=>a.l.startsWith(word)&&a.l!==word);
+  if(!acItems.length){ hideAC(); return; }
+  acSel=0;
+  const cols={led:'var(--ac)',flow:'var(--pu)',fn:'var(--ye)'};
+  acEl.innerHTML=acItems.map((a,i)=>
+    `<div class="aci${i===0?' sel':''}" onclick="insertAC(${i})" onmouseenter="acSel=${i};renderAC()">
+      <span style="color:${cols[a.t]}">${a.l}</span><span class="act">${a.t}</span>
+    </div>`).join('');
+  // position
+  const rect=ta.getBoundingClientRect();
+  const lines=before.split('\n');
+  const row=lines.length-1;
+  const col=lines[lines.length-1].length;
+  const lh=cfg.fs*1.6, cw=cfg.fs*0.6;
+  const x=rect.left+46+col*cw-escroll.scrollLeft;
+  const y=rect.top+row*lh-escroll.scrollTop;
+  acEl.style.cssText=`display:block;left:${x}px;top:${y+lh+2}px`;
+}
+function renderAC(){
+  acEl.querySelectorAll('.aci').forEach((e,i)=>e.classList.toggle('sel',i===acSel));
+}
+function hideAC(){ acEl.style.display='none'; acItems=[]; }
+function insertAC(i){
+  const it=acItems[i];
+  const pos=ta.selectionStart;
+  const before=code.slice(0,pos);
+  const m=before.match(/([A-Z_]+)$/);
+  if(!m){ hideAC(); return; }
+  const from=pos-m[1].length;
+  ta.focus();
+  ta.setSelectionRange(from,pos);
+  document.execCommand('insertText',false,it.s);
+  hideAC();
+}
+document.addEventListener('click',e=>{
+  if(!acEl.contains(e.target)) hideAC();
+  if(!document.getElementById('errtip').contains(e.target))
+    document.getElementById('errtip').style.display='none';
+});
+
+function onKeyDown(e){
+  if(acEl.style.display==='block'){
+    if(e.key==='ArrowDown'){ e.preventDefault(); acSel=Math.min(acSel+1,acItems.length-1); renderAC(); return; }
+    if(e.key==='ArrowUp'){   e.preventDefault(); acSel=Math.max(acSel-1,0); renderAC(); return; }
+    if(e.key==='Tab'||e.key==='Enter'){ e.preventDefault(); insertAC(acSel); return; }
+    if(e.key==='Escape'){ hideAC(); return; }
+  }
+  if(e.key==='Tab'){
+    e.preventDefault();
+    document.execCommand('insertText',false,' '.repeat(cfg.tab));
+    return;
+  }
+  if((e.ctrlKey||e.metaKey)&&e.key==='s'){ e.preventDefault(); doSave(); return; }
+  if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){ e.preventDefault(); toggleRun(); return; }
+  if(e.key==='F5'){ e.preventDefault(); toggleRun(); return; }
+}
+ta.addEventListener('input',showAC);
+
+// ═══════════════════ RUN / VM ═══════════════════
+let vm=null, running=false, raf=null, fpsF=0, fpsT=0;
+
+function toggleRun(){ running?doStop():doRun(); }
+
+function doRun(){
+  const res=compile(code);
+  if(res.errs.filter(e=>e.type==='error').length){
+    lg('⚠ Ошибки компиляции — исправь перед запуском','e');
+    res.errs.filter(e=>e.type==='error').forEach(e=>lg('  Стр '+e.line+': '+e.msg,'e'));
+    return;
+  }
+  lg('✓ Компиляция OK — '+res.bytes.length+' байт','o');
+  updateByView(res.bytes);
+  const {n}=getEmuParams();
+  epx=new Uint8Array(n*3);
+  vm=new VM(res.bytes,n,
+    (p,r,g,b)=>{ if(p*3+2<epx.length){epx[p*3]=r;epx[p*3+1]=g;epx[p*3+2]=b;} },
+    ()=>drawEmu(),
+    ()=>{ epx.fill(0); drawEmu(); }
+  );
+  vm.setSpeed(cfg.speed);
+  vm.play();
+  if(vm.state==='stop'){ lg('Программа пустая или не запустилась','w'); return; }
+  running=true; fpsF=0; fpsT=Date.now();
+  document.getElementById('runbtn').classList.add('stop');
+  document.getElementById('ricon').innerHTML='<rect x="4" y="3" width="3" height="10"/><rect x="9" y="3" width="3" height="10"/>';
+  document.getElementById('rtxt').textContent='СТОП';
+  loop();
+}
+
+function doStop(){
+  running=false;
+  if(raf){ cancelAnimationFrame(raf); raf=null; }
+  if(vm) vm.stop();
+  vm=null;
+  document.getElementById('runbtn').classList.remove('stop');
+  document.getElementById('ricon').innerHTML='<path d="M4 3l10 5-10 5V3z"/>';
+  document.getElementById('rtxt').textContent='ЗАПУСК';
+  document.getElementById('efps').textContent='— FPS';
+  drawEmu();
+}
+
+function loop(){
+  if(!running){ raf=null; return; }
+  if(vm){
+    vm.step();
+    if(vm.state==='stop'){ doStop(); return; }
+  }
+  fpsF++;
+  const now=Date.now();
+  if(now-fpsT>=600){
+    document.getElementById('efps').textContent=(fpsF*1000/(now-fpsT)|0)+' FPS';
+    fpsF=0; fpsT=now;
+    if(curBot==='var') updateVarView();
+  }
+  raf=requestAnimationFrame(loop);
+}
+
+// ═══════════════════ BOTTOM TABS ═══════════════════
+let curBot='con';
+function showBot(n){
+  curBot=n;
+  const panelMap={'con':'con','by':'byv','var':'varv'};
+  ['con','by','var'].forEach(id=>{
+    const el=document.getElementById(panelMap[id]);
+    if(el) el.style.display=(id===n)?'block':'none';
+    const tab=document.getElementById('bt-'+id);
+    if(tab) tab.classList.toggle('on',id===n);
+  });
+  if(n==='var') updateVarView();
+  if(n==='by'&&lastBytes) updateByView(lastBytes);
+}
+
+function lg(msg,t=''){
+  const el=document.getElementById('con');
+  const ts=new Date().toTimeString().slice(0,8);
+  const cls={e:'le',w:'lw',o:'lo',i:'li'}[t]||'';
+  el.innerHTML+=`<div class="${cls}"><span style="color:var(--t3)">[${ts}]</span> ${esc(''+msg)}</div>`;
+  el.scrollTop=el.scrollHeight;
+}
+
+let lastBytes=null;
+function updateByView(bytes){
+  lastBytes=bytes;
+  let s=`<span style="color:var(--t3)">Размер: ${bytes.length} байт</span>\n\n`;
+  let pc=0;
+  while(pc+2<bytes.length){
+    const hi=bytes[pc],lo=bytes[pc+1];
+    if(!hi&&!lo){ s+=`<span style="color:var(--t3)">EOF</span>`; break; }
+    const ln=(hi<<8)|lo, len=bytes[pc+2];
+    const body=Array.from(bytes.slice(pc+3,pc+3+len)).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+    s+=`<span style="color:var(--t3)">${(''+pc).padStart(4)}</span>  `+
+       `<span style="color:var(--pu)">${hi.toString(16).padStart(2,'0')} ${lo.toString(16).padStart(2,'0')}</span> `+
+       `<span style="color:var(--t2)">[${(''+len).padStart(3)}]</span> `+
+       `<span style="color:var(--t1)">${body}</span>  `+
+       `<span style="color:var(--t3)">; стр ${ln}</span>\n`;
+    pc+=3+len;
+  }
+  document.getElementById('byv').innerHTML=s;
+}
+
+function updateVarView(){
+  if(!vm) return;
+  document.getElementById('varv').innerHTML=
+    Array.from({length:26},(_,i)=>
+      `<div class="vi"><div class="vn">${String.fromCharCode(65+i)}</div><div class="vv">${vm.vars[i]}</div></div>`
+    ).join('');
+}
+
+// ═══════════════════ FILES ═══════════════════
+let fname='untitled.bas';
+const tabnameEl=document.getElementById('tabname');
+tabnameEl.addEventListener('change',()=>{
+  let v=tabnameEl.value.trim();
+  if(!v) v='untitled.bas';
+  if(!/\.bas$/.test(v)) v=v.replace(/\.[^.]*$/,'')+'.bas';
+  fname=v; tabnameEl.value=fname;
+});
+tabnameEl.addEventListener('keydown',e=>{
+  if(e.key==='Enter'||e.key==='Escape'){ e.preventDefault(); ta.focus(); }
+});
+
+function newFile(){
+  const doNew=()=>{
+    ta.value=''; code=''; fname='untitled.bas';
+    tabnameEl.value=fname;
+    document.getElementById('tab-dirty').style.display='none';
+    errs=[]; onInput(); lg('Новый файл','i');
+  };
+  if(code.trim()) showConfirm('Новый файл','Изменения будут потеряны.',doNew);
+  else doNew();
+}
+
+function showConfirm(title,msg,onOk){
+  document.getElementById('cfm-title').textContent=title;
+  document.getElementById('cfm-msg').textContent=msg;
+  document.getElementById('cfm-ok').onclick=()=>{ hideModal(); onOk(); };
+  showModal('m-cfm');
+}
+
+function openFile(){ document.getElementById('fopen').click(); }
+
+function onFileOpen(e){
+  const f=e.target.files[0]; if(!f) return;
+  const r=new FileReader();
+  const isBin=f.name.endsWith('.bin');
+  if(isBin) r.readAsArrayBuffer(f); else r.readAsText(f,'utf-8');
+  r.onload=ev=>{
+    if(isBin){
+      const b=new Uint8Array(ev.target.result);
+      ta.value=decompile(b); lg('Открыт .bin: '+f.name+' ('+b.length+' байт) → декомпилирован','o');
+    } else { ta.value=ev.target.result; lg('Открыт: '+f.name,'o'); }
+    fname=f.name.replace('.bin','.bas'); code=ta.value;
+    tabnameEl.value=fname;
+    document.getElementById('tab-dirty').style.display='none';
+    errs=[]; onInput();
+  };
+  e.target.value='';
+}
+
+function doSave(){
+  fname=tabnameEl.value.trim()||'untitled.bas';
+  tabnameEl.value=fname;
+  const blob=new Blob([code],{type:'text/plain'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=fname; a.click();
+  document.getElementById('tab-dirty').style.display='none';
+  notify('Сохранено: '+fname,'ok'); lg('Сохранено: '+fname,'o');
+}
+
+// ═══════════════════ FORMAT ═══════════════════
+function doFormat(){
+  const saved=ta.selectionStart;
+  ta.value=code.split('\n').map(line=>{
+    let s=line.trim(); if(!s) return '';
+    const ci=s.indexOf("'"); let cmt=''; if(ci>=0){ cmt=' '+s.slice(ci); s=s.slice(0,ci).trimEnd(); }
+    if(!s) return cmt.trim();
+    // uppercase keywords
+    for(const[w] of KW){
+      if(!/^[A-Z]/.test(w)) continue;
+      const re=new RegExp('(?<![A-Z0-9_])'+w+'(?![A-Z0-9_])','g');
+      s=s.replace(re,w);
+    }
+    // normalize commas and operators spacing
+    s=s.replace(/\s*,\s*/g,' , ')
+       .replace(/\s*(==|!=|>=|<=)\s*/g,' $1 ')
+       .replace(/\s+/g,' ').trim();
+    return s+(cmt||'');
+  }).join('\n');
+  code=ta.value; onInput(); notify('Отформатировано','ok');
+}
+
+// ═══════════════════ AUTO NUMBER ═══════════════════
+function showAutoNum(){
+  document.getElementById('an-s').value=cfg.ns;
+  document.getElementById('an-st').value=cfg.nst;
+  showModal('m-an');
+}
+
+function applyAutoNum(){
+  const start=+document.getElementById('an-s').value||10;
+  const step=+document.getElementById('an-st').value||10;
+  const renumber=document.getElementById('an-re').checked;
+  let n=start;
+  ta.value=code.split('\n').map(line=>{
+    const t=line.trim(); if(!t||t[0]==="'") return line;
+    if(renumber){
+      const m=t.match(/^(\d+)\s*(.*)/);
+      const body=m?m[2]:t;
+      const r=n+' '+body; n+=step; return r;
+    } else {
+      if(/^\d/.test(t)) return line;
+      const r=n+' '+t; n+=step; return r;
+    }
+  }).join('\n');
+  code=ta.value; onInput(); hideModal(); notify('Нумерация применена','ok');
+}
+
+// ═══════════════════ EXPORT ═══════════════════
+let compiledBytes=null;
+
+function showExport(){
+  const res=compile(code);
+  if(res.errs.filter(e=>e.type==='error').length){ notify('Исправь ошибки перед экспортом','err'); return; }
+  compiledBytes=res.bytes;
+  cfg.expMode='cs';
+  ['cs','pm','bas','bin'].forEach(m=>document.getElementById('et-'+m).classList.toggle('on',m==='cs'));
+  renderExport();
+  showModal('m-exp');
+}
+
+function setExpMode(m){
+  cfg.expMode=m;
+  ['cs','pm','bas','bin'].forEach(id=>document.getElementById('et-'+id).classList.toggle('on',id===m));
+  renderExport();
+}
+
+function renderExport(){
+  if(!compiledBytes) return;
+  const vn=(fname.replace(/\.[^.]+$/,'')||'script').replace(/[^a-zA-Z0-9_]/g,'_');
+  const ls=code.split('\n').filter(l=>l.trim());
+  let out='';
+  if(cfg.expMode==='cs'){
+    out=`const char* ${vn} =\n`+ls.map(l=>`    "${l.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}\\n"`).join('\n')+';';
+  } else if(cfg.expMode==='pm'){
+    out=`const char ${vn}[] PROGMEM =\n`+ls.map(l=>`    "${l.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}\\n"`).join('\n')+';';
+  } else if(cfg.expMode==='bas'){
+    out=code;
+  } else {
+    const hex=Array.from(compiledBytes).map(b=>b.toString(16).padStart(2,'0'));
+    out=`// ${vn}.bin — ${compiledBytes.length} bytes\nconst uint8_t ${vn}_bin[] PROGMEM = {\n`;
+    for(let i=0;i<hex.length;i+=16) out+='  '+hex.slice(i,i+16).map(h=>'0x'+h).join(', ')+',\n';
+    out+=`};\nconst uint16_t ${vn}_bin_size = ${compiledBytes.length};`;
+  }
+  document.getElementById('expc').textContent=out;
+}
+
+function copyExport(){
+  navigator.clipboard.writeText(document.getElementById('expc').textContent).then(()=>notify('Скопировано!','ok'));
+}
+
+function dlExport(){
+  if(!compiledBytes) return;
+  const vn=fname.replace(/\.[^.]+$/,'')||'script';
+  if(cfg.expMode==='bin'){
+    const b=new Blob([compiledBytes],{type:'application/octet-stream'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=vn+'.bin'; a.click();
+  } else {
+    const txt=document.getElementById('expc').textContent;
+    const ext=cfg.expMode==='bas'?'.bas':'.cpp';
+    const b=new Blob([txt],{type:'text/plain'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=vn+ext; a.click();
+  }
+  notify('Скачивается...','ok');
+}
+
+// ═══════════════════ SETTINGS ═══════════════════
+function showSettings(){
+  document.getElementById('cfg-fs').value=cfg.fs||13;
+  document.getElementById('cfg-tab').value=cfg.tab;
+  document.getElementById('cfg-ac').checked=cfg.ac;
+  document.getElementById('cfg-ns').value=cfg.ns;
+  document.getElementById('cfg-nst').value=cfg.nst;
+  document.getElementById('cfg-spd').value=cfg.speed;
+  document.getElementById('cfg-br').value=cfg.brightness;
+  showModal('m-set');
+}
+
+function applySettings(){
+  cfg.fs=+document.getElementById('cfg-fs').value||12.5;
+  cfg.tab=+document.getElementById('cfg-tab').value||2;
+  cfg.ac=document.getElementById('cfg-ac').checked;
+  cfg.ns=+document.getElementById('cfg-ns').value||10;
+  cfg.nst=+document.getElementById('cfg-nst').value||10;
+  cfg.speed=+document.getElementById('cfg-spd').value||100;
+  cfg.brightness=+document.getElementById('cfg-br').value||255;
+
+  const lh=cfg.fs*1.6;
+  const fss=cfg.fs+'px';
+  const lhs=lh+'px';
+  document.documentElement.style.setProperty('--FS',fss);
+  document.documentElement.style.setProperty('--LH',lhs);
+  ta.style.fontSize=fss; ta.style.lineHeight=lhs;
+  hlayer.style.fontSize=fss; hlayer.style.lineHeight=lhs;
+  document.querySelectorAll('.gln').forEach(el=>{el.style.height=lhs;el.style.lineHeight=lhs;});
+  if(vm) vm.setSpeed(cfg.speed);
+  document.getElementById('st-spd').textContent='×'+(cfg.speed/100).toFixed(1);
+  syncSize(); updateHL(); updateGutter(); drawEmu();
+  hideModal(); notify('Настройки применены','ok');
+}
+
+// ═══════════════════ MODAL / NOTIFY ═══════════════════
+function showModal(id){
+  document.querySelectorAll('.modal').forEach(m=>m.style.display='none');
+  document.getElementById(id).style.display='block';
+  document.getElementById('ov').classList.add('vis');
+}
+function hideModal(){ document.getElementById('ov').classList.remove('vis'); }
+
+let notifTimer=null;
+function notify(msg,t=''){
+  const el=document.getElementById('notif');
+  el.textContent=msg; el.className='vis '+(t==='ok'?'ok':t==='err'?'err':'');
+  clearTimeout(notifTimer); notifTimer=setTimeout(()=>el.className='',2500);
+}
+
+// ═══════════════════ RESIZE PANELS ═══════════════════
+const rh = document.getElementById('rh');
+const rv = document.getElementById('rv');
+const sb = document.getElementById('sb');
+const bot = document.getElementById('bot');
+
+let dragDir = null, startPos = 0, startSize = 0;
+
+// Горизонтальный ресайз (низ)
+rh.addEventListener('mousedown', e => {
+  dragDir = 'v'; startPos = e.clientY; startSize = bot.offsetHeight;
+  document.body.style.cssText = 'cursor:ns-resize;user-select:none';
+  rh.classList.add('drag');
+});
+
+// Вертикальный ресайз (левая панель)
+rv.addEventListener('mousedown', e => {
+  dragDir = 'h'; startPos = e.clientX; startSize = sb.offsetWidth;
+  document.body.style.cssText = 'cursor:ew-resize;user-select:none';
+  rv.classList.add('drag');
+});
+
+document.addEventListener('mousemove', e => {
+  if (!dragDir) return;
+  if (dragDir === 'v') {
+    const h = Math.max(60, Math.min(500, startSize + (startPos - e.clientY)));
+    bot.style.height = h + 'px';
+  } else if (dragDir === 'h') {
+    // Ограничиваем ширину эмулятора (от 180px до половины экрана)
+    const w = Math.max(180, Math.min(window.innerWidth / 2, startSize + (e.clientX - startPos)));
+    sb.style.width = w + 'px';
+    syncSize(); // Синхронизируем размер текста в редакторе
+  }
+});
+
+document.addEventListener('mouseup', () => {
+  if (dragDir) {
+    dragDir = null;
+    document.body.style.cssText = '';
+    rh.classList.remove('drag');
+    rv.classList.remove('drag');
+  }
+});
+
+// ═══════════════════ INIT ═══════════════════
+const DEMO=`' LedBasic IDE v3 — демо: радуга + искры
+10 N = 31
+20 H = 0
+
+100 P = 0
+110 C = H + P * 8
+120 SET_HSV P , C , 255 , 170
+130 S = RND 0 , 14
+140 IF S == 0 THEN SET P , 255 , 255 , 220
+150 P = P + 1
+160 IF P <= N THEN GOTO 110
+170 WAIT 25
+180 H = H + 4
+190 IF H > 255 THEN H = H - 256
+200 GOTO 100`;
+
+ta.value=DEMO;
+code=DEMO;
+resizeEmu();
+onInput();
+showBot('con');
+lg('LedBasic IDE v3','o');
+lg('Ctrl+Enter — Запуск  |  Ctrl+S — Сохранить  |  F5 — Запуск','i');
