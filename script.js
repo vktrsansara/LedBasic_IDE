@@ -781,6 +781,7 @@ function onInput(){
     updateHL();
     updateGutter();
     updateErrStatus();
+    updateVarView();
   },300);
   onSelChange();
 }
@@ -986,12 +987,27 @@ function updateByView(bytes){
   document.getElementById('byv').innerHTML=s;
 }
 
+function getUsedVars(){
+  const used=new Set();
+  const lines=code.split('\n');
+  for(let line of lines){
+    let s=line.trim(); if(!s) continue;
+    const ci=s.indexOf("'"); if(ci>=0) s=s.slice(0,ci);
+    // find standalone A-Z
+    const ms=s.matchAll(/(?<![A-Z0-9_])([A-Z])(?![A-Z0-9_])/g);
+    for(const m of ms) used.add(m[1].charCodeAt(0)-65);
+  }
+  return used;
+}
+
 function updateVarView(){
-  if(!vm) return;
+  const used=getUsedVars();
   document.getElementById('varv').innerHTML=
-    Array.from({length:26},(_,i)=>
-      `<div class="vi"><div class="vn">${String.fromCharCode(65+i)}</div><div class="vv">${vm.vars[i]}</div></div>`
-    ).join('');
+    Array.from({length:26},(_,i)=> {
+      const v = vm ? vm.vars[i] : 0;
+      const isUsed = used.has(i);
+      return `<div class="vi${isUsed?' used':''}"><div class="vn">${String.fromCharCode(65+i)}</div><div class="vv">${v}</div></div>`;
+    }).join('');
 }
 
 // ═══════════════════ FILES ═══════════════════
