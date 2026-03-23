@@ -9,18 +9,21 @@ const T={
   VAR:0x30,NUM:0x31,
   ASSIGN:0x40,EQ:0x41,NEQ:0x42,GT:0x43,LT:0x44,GE:0x45,LE:0x46,
   PLUS:0x50,MINUS:0x51,MUL:0x52,DIV:0x53,MOD:0x54,AND:0x55,OR:0x56,
-  RND:0x60,ABS:0x61,MIN:0x62,MAX:0x63,SIN8:0x64,COS8:0x65,PIXEL:0x66
+  RND:0x60,ABS:0x61,MIN:0x62,MAX:0x63,SIN8:0x64,COS8:0x65,PIXEL:0x66,NOISE:0x67,
+  MAP:0x68,CONSTRAIN:0x69,EXP8:0x6A
 };
 
 // sorted longest-first
 const KW=[
   ['SET_HSV',T.SETHSV],['RETURN',T.RETURN],['GOSUB',T.GOSUB],
+  ['CONSTRAIN',T.CONSTRAIN],
   ['DELAY',T.DELAY],['CLEAR',T.CLEAR],['BRIGHT',T.BRIGHT],
   ['FILL',T.FILL],['SHOW',T.SHOW],['WAIT',T.WAIT],
   ['GOTO',T.GOTO],['NEXT',T.NEXT],['STEP',T.STEP],
   ['THEN',T.THEN],['SET',T.SET],['FOR',T.FOR],
   ['TO',T.TO],['IF',T.IF],
-  ['SIN8',T.SIN8],['COS8',T.COS8],['PIXEL',T.PIXEL],
+  ['SIN8',T.SIN8],['COS8',T.COS8],['NOISE',T.NOISE],['PIXEL',T.PIXEL],
+  ['EXP8',T.EXP8],['MAP',T.MAP],
   ['RND',T.RND],['ABS',T.ABS],['MIN',T.MIN],['MAX',T.MAX],
   ['AND',T.AND],['OR',T.OR],
   ['==',T.EQ],['!=',T.NEQ],['>=',T.GE],['<=',T.LE],
@@ -33,6 +36,53 @@ const SIN8=new Uint8Array(256);
 for(let i=0;i<256;i++) SIN8[i]=Math.round(128+127*Math.sin(i*2*Math.PI/256));
 const sin8=x=>SIN8[x&255];
 const cos8=x=>SIN8[(x+64)&255];
+
+// 2D Value Noise — точное соответствие LedBasic.cpp inoise8()
+// x, y — uint16 (0..65535), возвращает 0..255
+function inoise8(x, y){
+  const xi=(x>>8)&255, yi=(y>>8)&255;
+  const xf=x&255,      yf=y&255;
+  // ease curve (smoothstep): u = xf² × (765 - 2×xf) >> 16
+  const ease=u=>{ const uu=u&255; return ((uu*uu*(765-2*uu))>>16)&255; };
+  const u=ease(xf), v=ease(yf);
+  // hash — тот же алгоритм что в C++ (усечение до uint8)
+  const hash=(i,j)=>{
+    let s=(((i*0x9E3779B9)>>>0)+((j*0x85EBCA6B)>>>0))>>>0;
+    s=(s^(s>>>13))>>>0;
+    s=Math.imul(s,0xC2B2AE35)>>>0;
+    s=(s^(s>>>16))>>>0;
+    return s&255;
+  };
+  const h00=hash(xi,   yi);
+  const h10=hash((xi+1)&255, yi);
+  const h01=hash(xi,   (yi+1)&255);
+  const h11=hash((xi+1)&255, (yi+1)&255);
+  const nx0=(h00+((((h10-h00)*u)>>8)))&255;
+  const nx1=(h01+((((h11-h01)*u)>>8)))&255;
+  return (nx0+((((nx1-nx0)*v)>>8)))&255;
+}
+
+// EXP8 — гамма-таблица: round(255 * (x/255)^2.2)
+const _exp8=new Uint8Array([
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,
+    1,  1,  1,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,  2,
+    3,  3,  3,  3,  3,  4,  4,  4,  4,  5,  5,  5,  5,  6,  6,  6,
+    6,  7,  7,  7,  8,  8,  8,  9,  9,  9, 10, 10, 11, 11, 11, 12,
+   12, 13, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19,
+   20, 20, 21, 22, 22, 23, 23, 24, 25, 25, 26, 26, 27, 28, 28, 29,
+   30, 30, 31, 32, 33, 33, 34, 35, 35, 36, 37, 38, 39, 39, 40, 41,
+   42, 43, 43, 44, 45, 46, 47, 48, 49, 49, 50, 51, 52, 53, 54, 55,
+   56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
+   73, 74, 75, 76, 77, 78, 79, 81, 82, 83, 84, 85, 87, 88, 89, 90,
+   91, 93, 94, 95, 97, 98, 99,100,102,103,105,106,107,109,110,111,
+  113,114,116,117,119,120,121,123,124,126,127,129,130,132,133,135,
+  137,138,140,141,143,145,146,148,149,151,153,154,156,158,159,161,
+  163,165,166,168,170,172,173,175,177,179,181,182,184,186,188,190,
+  192,194,196,197,199,201,203,205,207,209,211,213,215,217,219,221,
+  223,225,227,229,231,234,236,238,240,242,244,246,248,251,253,255
+]);
+const exp8=x=>_exp8[x<0?0:x>255?255:x];
+
 const clamp=v=>Math.max(0,Math.min(255,v+.5|0));
 const s16=v=>{v=v&0xFFFF;return v>=32768?v-65536:v};
 
@@ -307,7 +357,22 @@ class VM{
     if(op===T.MAX){ const a=this.expr(); this.f(); const b=this.expr(); return s16(Math.max(a,b)); }
     if(op===T.SIN8) return s16(sin8(this.expr()&255));
     if(op===T.COS8) return s16(cos8(this.expr()&255));
+    if(op===T.NOISE){ const x=this.expr(); this.f()/*COMMA*/; const t=this.expr(); return s16(inoise8(x&0xFFFF, t&0xFFFF)); }
     if(op===T.PIXEL) return s16(this.n-1);
+    if(op===T.EXP8){ return s16(exp8(this.expr())); }
+    if(op===T.CONSTRAIN){
+      const v=this.expr(); this.f(); const lo=this.expr(); this.f(); const hi=this.expr();
+      return s16(v<lo?lo:v>hi?hi:v);
+    }
+    if(op===T.MAP){
+      const val=this.expr(); this.f();
+      const i0=this.expr();  this.f();
+      const i1=this.expr();  this.f();
+      const o0=this.expr();  this.f();
+      const o1=this.expr();
+      if(i1===i0) return s16(o0);
+      return s16(Math.trunc((val-i0)*(o1-o0)/(i1-i0))+o0);
+    }
     return 0;
   }
 
@@ -607,7 +672,7 @@ function syncSize(){
 // ── Highlight ──
 const LED_KW=new Set(['CLEAR','FILL','SET_HSV','SET','WAIT','DELAY','SHOW','BRIGHT']);
 const FLOW_KW=new Set(['FOR','TO','STEP','NEXT','IF','THEN','GOTO','GOSUB','RETURN']);
-const FN_KW=new Set(['RND','ABS','MIN','MAX','SIN8','COS8','AND','OR','PIXEL']);
+const FN_KW=new Set(['RND','ABS','MIN','MAX','SIN8','COS8','NOISE','MAP','CONSTRAIN','EXP8','AND','OR','PIXEL']);
 
 function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
@@ -814,6 +879,10 @@ const ACL=[
   {l:'ABS',t:'fn',s:'ABS '},
   {l:'SIN8',t:'fn',s:'SIN8 '},
   {l:'COS8',t:'fn',s:'COS8 '},
+  {l:'NOISE',t:'fn',s:'NOISE  , '},
+  {l:'EXP8',t:'fn',s:'EXP8 '},
+  {l:'MAP',t:'fn',s:'MAP  , 0 , 255 , 0 , 255'},
+  {l:'CONSTRAIN',t:'fn',s:'CONSTRAIN  , 0 , 255'},
   {l:'MIN',t:'fn',s:'MIN  , '},
   {l:'MAX',t:'fn',s:'MAX  , '},
   {l:'PIXEL',t:'fn',s:'PIXEL'},
