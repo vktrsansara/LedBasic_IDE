@@ -70,6 +70,23 @@
         </div>
 
         <div class="tgrp">
+          <div class="tbdrop" id="dd-examples">
+            <button class="btn" onclick="toggleExamples(event)">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M2 3h12M2 6h8M2 9h10M2 12h6"/>
+              </svg>Примеры<span class="ddcaret">▾</span>
+            </button>
+            <div class="ddmenu" id="dd-examples-menu"></div>
+          </div>
+          <button class="btn" onclick="showReference()">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="8" cy="8" r="6"/>
+              <path d="M8 7v5M8 5v1"/>
+            </svg>Справочник
+          </button>
+        </div>
+
+        <div class="tgrp">
           <button class="btn" onclick="showExport()">
             <svg
               viewBox="0 0 16 16"
@@ -387,9 +404,19 @@
           <button class="mb p" id="cfm-ok">OK</button>
         </div>
       </div>
-    </div>
+      <!-- СПРАВОЧНИК -->
+      <div class="modal modal-wide" id="m-ref" style="display:none">
+        <div class="mhd">
+          <span>📖 Справочник LedBasic</span>
+          <div style="display:flex;gap:6px;align-items:center">
+            <div class="ref-tabs" id="ref-tabs"></div>
+            <button class="mxb" onclick="hideModal()">×</button>
+          </div>
+        </div>
+        <div id="ref-body" style="overflow:auto;padding:0;flex:1;min-height:0"></div>
+      </div>
 
-    <div id="errtip"></div>
+    </div><!-- /ov -->
     <div id="acp"></div>
     <div id="notif"></div>
     <input
@@ -399,6 +426,7 @@
       style="display: none"
       onchange="onFileOpen(event)"
     />
+    <script src="reference.js"></script>
     <script src="script.js"></script>
   </body>
 </html>

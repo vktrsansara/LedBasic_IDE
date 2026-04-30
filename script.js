@@ -1,11 +1,11 @@
 'use strict';
 // ═══════════════════ TOKENS ═══════════════════
 const T={
-  EOF:0,EOL:1,COMMA:2,
+  EOF:0,EOL:1,COMMA:2,LPAREN:0x03,RPAREN:0x04,
   FOR:0x10,TO:0x11,STEP:0x12,NEXT:0x13,
   IF:0x14,THEN:0x15,GOTO:0x16,GOSUB:0x17,RETURN:0x18,
   CLEAR:0x20,FILL:0x21,SET:0x22,SETHSV:0x23,
-  WAIT:0x24,DELAY:0x25,SHOW:0x26,BRIGHT:0x27,
+  WAIT:0x24,DELAY:0x25,SHOW:0x26,BRIGHT:0x27,FADE:0x28,MIRROR:0x29,
   VAR:0x30,NUM:0x31,
   ASSIGN:0x40,EQ:0x41,NEQ:0x42,GT:0x43,LT:0x44,GE:0x45,LE:0x46,
   PLUS:0x50,MINUS:0x51,MUL:0x52,DIV:0x53,MOD:0x54,AND:0x55,OR:0x56,
@@ -16,8 +16,8 @@ const T={
 // sorted longest-first
 const KW=[
   ['SET_HSV',T.SETHSV],['RETURN',T.RETURN],['GOSUB',T.GOSUB],
-  ['CONSTRAIN',T.CONSTRAIN],
-  ['DELAY',T.DELAY],['CLEAR',T.CLEAR],['BRIGHT',T.BRIGHT],
+  ['CONSTRAIN',T.CONSTRAIN],['MIRROR',T.MIRROR],
+  ['DELAY',T.DELAY],['CLEAR',T.CLEAR],['BRIGHT',T.BRIGHT],['FADE',T.FADE],
   ['FILL',T.FILL],['SHOW',T.SHOW],['WAIT',T.WAIT],
   ['GOTO',T.GOTO],['NEXT',T.NEXT],['STEP',T.STEP],
   ['THEN',T.THEN],['SET',T.SET],['FOR',T.FOR],
@@ -137,6 +137,9 @@ function compileLine(raw){
         body.push(T.VAR, s.charCodeAt(p)-65); p++; continue;
       }
     }
+    // parentheses
+    if(s[p]==='('){ body.push(T.LPAREN); p++; continue; }
+    if(s[p]===')'){ body.push(T.RPAREN); p++; continue; }
     return{err:'Неизвестный токен: "'+s.slice(p,p+8)+'"'};
   }
   body.push(T.EOL);
@@ -239,6 +242,8 @@ class VM{
     this.vars=new Int16Array(26);
     this.cstack=[]; this.fstack=[];
     this.pc=0; this.state='stop'; this.wu=0; this.speed=100;
+    // frame buffer для FADE/MIRROR
+    this.fbuf=new Uint8Array(n*3);
     // build line index: lineNum -> bodyStart
     this.idx={}; let pp=0;
     while(pp+2<bytes.length){
@@ -267,11 +272,20 @@ class VM{
     this.curLine=0; // index into lineNums
     this.pc=this.idx[this.lineNums[0]];
     this.state='run';
+    this.fbuf.fill(0);
   }
 
-  stop(){ this.state='stop'; this.onClear(); }
+  stop(){ this.state='stop'; this.onClear(); this.fbuf.fill(0); }
   setSpeed(s){ this.speed=Math.max(1,Math.min(1000,s)); }
   asp(ms){ return ms<=0?0:Math.round(ms*100/this.speed); }
+
+  // setpx: записывает пиксель в fbuf И вызывает onPx
+  setpx(pos,r,g,b){
+    if(pos>=0&&pos<this.n){
+      this.onPx(pos,r,g,b);
+      const idx=pos*3; this.fbuf[idx]=r; this.fbuf[idx+1]=g; this.fbuf[idx+2]=b;
+    }
+  }
 
   // fetch one byte
   f(){ return this.b[this.pc++]; }
@@ -373,6 +387,11 @@ class VM{
       if(i1===i0) return s16(o0);
       return s16(Math.trunc((val-i0)*(o1-o0)/(i1-i0))+o0);
     }
+    if(op===T.LPAREN){
+      const v=this.expr();
+      if(this.b[this.pc]===T.RPAREN) this.pc++;
+      return v;
+    }
     return 0;
   }
 
@@ -402,7 +421,7 @@ class VM{
         const r=this.expr(); this.f()/*,*/;
         const g=this.expr(); this.f()/*,*/;
         const bv=this.expr();
-        if(pos>=0&&pos<this.n) this.onPx(pos,clamp(r),clamp(g),clamp(bv));
+        this.setpx(pos,clamp(r),clamp(g),clamp(bv));
         break;
       }
       case T.SETHSV:{
@@ -410,15 +429,15 @@ class VM{
         const h=this.expr(); this.f();
         const sv=this.expr(); this.f();
         const v=this.expr();
-        if(pos>=0&&pos<this.n){const[r,g,b]=this.hsv(h,sv,v);this.onPx(pos,r,g,b);}
+        if(pos>=0&&pos<this.n){const[r,g,b]=this.hsv(h,sv,v);this.setpx(pos,r,g,b);}
         break;
       }
-      case T.CLEAR: this.onClear(); break;
+      case T.CLEAR: this.onClear(); this.fbuf.fill(0); break;
       case T.FILL:{
         const r=this.expr(); this.f();
         const g=this.expr(); this.f();
         const bv=this.expr();
-        for(let i=0;i<this.n;i++) this.onPx(i,clamp(r),clamp(g),clamp(bv));
+        for(let i=0;i<this.n;i++) this.setpx(i,clamp(r),clamp(g),clamp(bv));
         break;
       }
       case T.SHOW: this.onShow(); break;
@@ -506,6 +525,30 @@ class VM{
         return 'next';
       }
       case T.BRIGHT: this.expr(); break;
+      case T.FADE:{
+        const pos=this.expr(); this.f()/*COMMA*/; const amt=this.expr();
+        if(pos>=0&&pos<this.n&&this.fbuf){
+          const idx=pos*3;
+          const a=Math.max(0,Math.min(255,amt));
+          const r=Math.max(0,this.fbuf[idx]  -a);
+          const g=Math.max(0,this.fbuf[idx+1]-a);
+          const b=Math.max(0,this.fbuf[idx+2]-a);
+          this.setpx(pos,r,g,b);
+          this.fbuf[idx]=r; this.fbuf[idx+1]=g; this.fbuf[idx+2]=b;
+        }
+        break;
+      }
+      case T.MIRROR:{
+        if(this.fbuf){
+          const half=this.n>>1;
+          for(let i=0;i<half;i++){
+            const src=i*3;
+            const dst=this.n-1-i;
+            this.setpx(dst,this.fbuf[src],this.fbuf[src+1],this.fbuf[src+2]);
+          }
+        }
+        break;
+      }
       default: break;
     }
     return 'ok';
@@ -522,7 +565,7 @@ class VM{
         const r=this.expr(); this.f();
         const g=this.expr(); this.f();
         const bv=this.expr();
-        if(pos>=0&&pos<this.n) this.onPx(pos,clamp(r),clamp(g),clamp(bv));
+        this.setpx(pos,clamp(r),clamp(g),clamp(bv));
         break;
       }
       case T.SETHSV:{
@@ -530,7 +573,26 @@ class VM{
         const h=this.expr(); this.f();
         const sv=this.expr(); this.f();
         const v=this.expr();
-        if(pos>=0&&pos<this.n){const[r,g,b]=this.hsv(h,sv,v);this.onPx(pos,r,g,b);}
+        if(pos>=0&&pos<this.n){const[r,g,b]=this.hsv(h,sv,v);this.setpx(pos,r,g,b);}
+        break;
+      }
+      case T.CLEAR: this.onClear(); this.fbuf.fill(0); break;
+      case T.FADE:{
+        const pos=this.expr(); this.f(); const amt=this.expr();
+        if(pos>=0&&pos<this.n&&this.fbuf){
+          const idx=pos*3, a=Math.max(0,Math.min(255,amt));
+          this.setpx(pos,Math.max(0,this.fbuf[idx]-a),Math.max(0,this.fbuf[idx+1]-a),Math.max(0,this.fbuf[idx+2]-a));
+        }
+        break;
+      }
+      case T.MIRROR:{
+        if(this.fbuf){
+          const half=this.n>>1;
+          for(let i=0;i<half;i++){
+            const src=i*3;
+            this.setpx(this.n-1-i,this.fbuf[src],this.fbuf[src+1],this.fbuf[src+2]);
+          }
+        }
         break;
       }
       case T.GOTO:{
@@ -670,7 +732,7 @@ function syncSize(){
 }
 
 // ── Highlight ──
-const LED_KW=new Set(['CLEAR','FILL','SET_HSV','SET','WAIT','DELAY','SHOW','BRIGHT']);
+const LED_KW=new Set(['CLEAR','FILL','SET_HSV','SET','WAIT','DELAY','SHOW','BRIGHT','FADE','MIRROR']);
 const FLOW_KW=new Set(['FOR','TO','STEP','NEXT','IF','THEN','GOTO','GOSUB','RETURN']);
 const FN_KW=new Set(['RND','ABS','MIN','MAX','SIN8','COS8','NOISE','MAP','CONSTRAIN','EXP8','AND','OR','PIXEL']);
 
@@ -875,7 +937,8 @@ const ACL=[
   {l:'WAIT',t:'led',s:'WAIT 20'},
   {l:'DELAY',t:'led',s:'DELAY 500'},
   {l:'SHOW',t:'led',s:'SHOW'},
-  {l:'RND',t:'fn',s:'RND 0 , 255'},
+  {l:'FADE',t:'led',s:'FADE  , 30'},
+  {l:'MIRROR',t:'led',s:'MIRROR'},
   {l:'ABS',t:'fn',s:'ABS '},
   {l:'SIN8',t:'fn',s:'SIN8 '},
   {l:'COS8',t:'fn',s:'COS8 '},
@@ -1246,6 +1309,312 @@ function dlExport(){
 }
 
 // ═══════════════════ SETTINGS ═══════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+//  ПРИМЕРЫ
+// ══════════════════════════════════════════════════════════════════════════════
+const EXAMPLES = [
+  { cat:'Начало' },
+  { name:'Статичный цвет',    desc:'Все пиксели одним цветом',
+    code:`10 FILL 255 , 80 , 0    ' залить лентуа оранжевым
+20 SHOW                    ' вывести на ленту
+30 DELAY 1000              ' ждать 1 секунду (без Show)
+40 GOTO 30                 ' бесконечное ожидание` },
+  { name:'Мигание',           desc:'Лента мигает с частотой 1 Гц',
+    code:`10 FILL 0 , 0 , 255     ' синий
+20 WAIT 500                ' показать и подождать
+30 CLEAR                   ' погасить
+40 WAIT 500
+50 GOTO 10` },
+  { name:'Плавное дыхание',   desc:'Яркость пульсирует по синусу',
+    code:`10 T = 0
+20 V = SIN8 T              ' синус → 0..255
+30 V = EXP8 V              ' гамма-коррекция (естественнее)
+40 FILL 200 , 60 , V
+50 WAIT 14
+60 T = T + 2
+70 IF T > 255 THEN T = 0
+80 GOTO 20` },
+  { name:'Радуга',            desc:'Полный спектр по всей ленте',
+    code:`10 H = 0
+20 FOR I = 0 TO PIXEL
+30   C = H + I * 256 / PIXEL
+40   SET_HSV I , C , 255 , 180
+50 NEXT I
+60 WAIT 30
+70 H = H + 3
+80 IF H > 255 THEN H = H - 256
+90 GOTO 20` },
+  { cat:'Движение' },
+  { name:'Комета',            desc:'Хвост с затуханием, меняет цвет',
+    code:`10 H = 0
+20 P = 0
+30 CLEAR
+40 V = 160
+50 FOR T = 1 TO 8
+60   Q = P - T
+70   IF Q >= 0 THEN SET_HSV Q , H , 255 , V
+80   V = V * 3 / 4
+90 NEXT T
+100 SET P , 255 , 255 , 255
+110 WAIT 25
+120 P = P + 1
+130 IF P <= PIXEL THEN GOTO 30
+140 CLEAR
+150 WAIT 200
+160 H = H + 40
+170 IF H > 255 THEN H = H - 256
+180 GOTO 20` },
+  { name:'Комета FADE',       desc:'Комета через буфер кадра',
+    code:`10 H = 0
+20 P = 0
+100 FOR I = 0 TO PIXEL
+110   FADE I , 35
+120 NEXT I
+130 SET_HSV P , H , 255 , 255
+140 WAIT 30
+150 P = P + 1
+160 IF P <= PIXEL THEN GOTO 100
+170 H = H + 40
+180 IF H > 255 THEN H = (H - 256)
+190 CLEAR
+200 WAIT 300
+210 P = 0
+220 GOTO 100` },
+  { name:'Маятник (Scan)',    desc:'Один пиксель туда-обратно',
+    code:`10 H = 0
+' движение вперёд: 0 → PIXEL
+20 FOR I = 0 TO PIXEL
+30   IF I > 0 THEN SET I - 1 , 0 , 0 , 0
+40   SET_HSV I , H , 255 , 255
+50   WAIT 35
+60 NEXT I
+' движение назад: PIXEL → 0
+70 FOR I = PIXEL TO 0 STEP -1
+80   IF I < PIXEL THEN SET I + 1 , 0 , 0 , 0
+90   SET_HSV I , H , 255 , 255
+100  WAIT 35
+110 NEXT I
+120 H = H + 30
+130 IF H > 255 THEN H = H - 256
+140 GOTO 20` },
+  { name:'Бегущий паттерн',   desc:'Theater Chase — каждый третий светится',
+    code:`10 H = 0
+11 Z = 0
+20 FOR I = 0 TO PIXEL
+30   R = I + Z
+40   R = R % 3
+50   IF R == 0 THEN SET_HSV I , H , 255 , 200
+60   IF R != 0 THEN SET I , 0 , 0 , 0
+70 NEXT I
+80 WAIT 80
+90 Z = Z + 1
+100 IF Z > 2 THEN Z = 0
+110 IF Z == 0 THEN H = H + 20
+120 IF H > 255 THEN H = H - 256
+130 GOTO 20` },
+  { cat:'Эффекты' },
+  { name:'Огонь',             desc:'Языки пламени через шум',
+    code:`10 T = 0
+20 FOR I = 0 TO PIXEL
+30   X = I * 25
+40   N = NOISE X , T
+50   U = X * 4
+60   N = N * 3 + NOISE U , T * 3
+70   N = N / 4
+80   H = MAP N , 0 , 255 , 0 , 30
+90   N = CONSTRAIN N , 0 , 255
+100  V = EXP8 N
+110  SET_HSV I , H , 255 , V
+120 NEXT I
+130 WAIT 25
+140 T = T + 5
+150 IF T > 32000 THEN T = 0
+160 GOTO 20` },
+  { name:'Океан',             desc:'Волны с гребнями',
+    code:`10 T = 0
+20 FOR I = 0 TO PIXEL
+30   X = I * 30
+40   S = NOISE X , T
+50   W = NOISE (X * 3) , (T * 4)
+60   V = (S / 2) + (W / 2)
+70   H = 140 + S / 8
+80   SET_HSV I , H , 255 , V
+90   IF V > 220 THEN SET I , 200 , 230 , 255
+100 NEXT I
+110 WAIT 25
+120 T = T + 3
+130 IF T > 32000 THEN T = 0
+140 GOTO 20` },
+  { name:'Лава',              desc:'Minecraft Lava — три октавы шума',
+    code:`10 T = 0
+20 FOR I = 0 TO PIXEL
+30   X = I * 25
+40   N = NOISE X , T
+50   B = NOISE (X * 3) , (T * 2)
+60   C = NOISE (X * 5) , (T * 3)
+70   V = ((N * 4) + (B * 2) + C) / 7
+80   IF V >= 80 THEN GOTO 120
+90   SET I , (V * 2) , 0 , 0
+100  GOTO 180
+120  IF V >= 160 THEN GOTO 140
+130  SET I , 255 , ((V * 2) - 160) , 0
+131  GOTO 180
+140  IF V >= 220 THEN GOTO 160
+150  SET I , 255 , (V + (V / 2) - 80) , 0
+151  GOTO 180
+160  SET I , 255 , 220 , ((V - 220) * 4)
+180 NEXT I
+190 WAIT 30
+200 T = T + 4
+210 IF T > 32000 THEN T = 0
+220 GOTO 20` },
+  { name:'Северное сияние',   desc:'Aurora — NOISE + MAP + EXP8',
+    code:`10 T = 0
+20 FOR I = 0 TO PIXEL
+30   X = I * 22
+40   N = NOISE X , T
+50   H = MAP N , 0 , 255 , 85 , 200
+60   V = EXP8 N
+70   S = MAP V , 0 , 255 , 120 , 255
+80   SET_HSV I , H , S , V
+90 NEXT I
+100 WAIT 30
+110 T = T + 2
+120 IF T > 32000 THEN T = 0
+130 GOTO 20` },
+  { cat:'Матрица 16×16' },
+  { name:'Плазма 16×16',      desc:'Три SIN8-волны на матрице',
+    code:`10 T = 0
+20 FOR I = 0 TO 255
+30   R = I / 16
+40   C = I % 16
+50   Z = R % 2
+60   IF Z == 1 THEN C = 15 - C
+70   X = C * 16
+80   Y = R * 16
+90   A = (X + T) % 256
+100  H = SIN8 A
+110  B = (Y + 256 - T) % 256
+120  S = COS8 B
+130  H = H + S
+140  C = (X + Y + T) % 256
+150  S = SIN8 C
+160  H = H + S
+170  H = H / 3
+180  SET_HSV I , H , 255 , 255
+190 NEXT I
+200 WAIT 25
+210 T = T + 3
+220 IF T > 255 THEN T = (T - 256)
+230 GOTO 20` },
+  { name:'Лава 16×16',       desc:'Эффект лавы',
+    code:`10 T = 0
+20 FOR I = 0 TO PIXEL
+30   X = I * 25
+40   N = NOISE X , T
+50   U = X * 3
+60   B = NOISE U , T * 2
+70   U = X * 5
+80   C = NOISE U , T * 3
+90   V = N * 4 + B * 2 + C
+100  V = V / 7
+110  IF V >= 80 THEN GOTO 150
+120  R = V * 2
+130  SET I , R , 0 , 0
+140  GOTO 210
+150  IF V >= 160 THEN GOTO 170
+160  G = V * 2 - 160
+161  SET I , 255 , G , 0
+162  GOTO 210
+170  IF V >= 220 THEN GOTO 190
+180  G = V + V / 2 - 80
+181  SET I , 255 , G , 0
+182  GOTO 210
+190  G = 220
+200  B = V - 220
+201  B = B * 4
+202  SET I , 255 , G , B
+210 NEXT I
+220 WAIT 30
+230 T = T + 4
+240 IF T > 32000 THEN T = 0
+250 GOTO 20` },
+];
+
+function buildExamplesMenu(){
+  const menu=document.getElementById('dd-examples-menu');
+  menu.innerHTML='';
+  EXAMPLES.forEach(ex=>{
+    if(ex.cat){
+      const d=document.createElement('div');
+      d.className='ddcat'; d.textContent=ex.cat;
+      menu.appendChild(d);
+    } else {
+      const d=document.createElement('div');
+      d.className='dditem';
+      d.innerHTML=`<span class="dditem-name">${ex.name}</span><span class="dditem-desc">${ex.desc}</span>`;
+      d.onclick=()=>loadExample(ex);
+      menu.appendChild(d);
+    }
+  });
+}
+
+function toggleExamples(e){
+  e.stopPropagation();
+  const menu=document.getElementById('dd-examples-menu');
+  const isOpen=menu.classList.contains('open');
+  closeAllDropdowns();
+  if(!isOpen) menu.classList.add('open');
+}
+function closeAllDropdowns(){
+  document.querySelectorAll('.ddmenu').forEach(m=>m.classList.remove('open'));
+}
+document.addEventListener('click', closeAllDropdowns);
+
+function loadExample(ex){
+  closeAllDropdowns();
+  if(code && code.trim()){
+    const go=()=>{ code=ex.code; ta.value=code; onInput(); setDirty(true);
+      document.getElementById('tabname').value=ex.name.replace(/\s+/g,'_').toLowerCase()+'.bas';
+    };
+    showConfirm('Загрузить пример?',`Текущий код будет заменён на «${ex.name}».`,go);
+  } else {
+    code=ex.code; ta.value=code; onInput(); setDirty(true);
+    document.getElementById('tabname').value=ex.name.replace(/\s+/g,'_').toLowerCase()+'.bas';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  СПРАВОЧНИК
+// ══════════════════════════════════════════════════════════════════════════════
+
+function showReference(){
+  const tabsEl=document.getElementById('ref-tabs');
+  const bodyEl=document.getElementById('ref-body');
+  if(!tabsEl.hasChildNodes()){
+    REFERENCE.forEach((pg,i)=>{
+      const t=document.createElement('div');
+      t.className='ref-tab'+(i===0?' on':'');
+      t.textContent=pg.label;
+      t.onclick=()=>switchRefTab(i);
+      tabsEl.appendChild(t);
+      const p=document.createElement('div');
+      p.className='ref-page'+(i===0?' on':'');
+      p.innerHTML=pg.html;
+      bodyEl.appendChild(p);
+    });
+  }
+  showModal('m-ref');
+}
+
+function switchRefTab(idx){
+  document.querySelectorAll('.ref-tab').forEach((t,i)=>t.classList.toggle('on',i===idx));
+  document.querySelectorAll('.ref-page').forEach((p,i)=>p.classList.toggle('on',i===idx));
+}
+
+// Init examples menu on load
+document.addEventListener('DOMContentLoaded',buildExamplesMenu);
+
 function showSettings(){
   document.getElementById('cfg-fs').value=cfg.fs||13;
   document.getElementById('cfg-tab').value=cfg.tab;
@@ -1282,11 +1651,19 @@ function applySettings(){
 
 // ═══════════════════ MODAL / NOTIFY ═══════════════════
 function showModal(id){
-  document.querySelectorAll('.modal').forEach(m=>m.style.display='none');
-  document.getElementById(id).style.display='block';
+  // Hide all modals with display:none
+  document.querySelectorAll('.modal').forEach(m=>{
+    m.style.display='none';
+  });
+  // Show target — reference needs flex, others need block
+  const el=document.getElementById(id);
+  if(el) el.style.display=(id==='m-ref')?'flex':'block';
   document.getElementById('ov').classList.add('vis');
 }
-function hideModal(){ document.getElementById('ov').classList.remove('vis'); }
+function hideModal(){
+  document.getElementById('ov').classList.remove('vis');
+  document.querySelectorAll('.modal').forEach(m=>m.style.display='none');
+}
 
 let notifTimer=null;
 function notify(msg,t=''){
@@ -1360,6 +1737,11 @@ ta.value=DEMO;
 code=DEMO;
 resizeEmu();
 onInput();
+// Явно скрываем все панели нижней зоны до вызова showBot
+['con','byv','varv'].forEach(id=>{
+  const el=document.getElementById(id);
+  if(el) el.style.display='none';
+});
 showBot('con');
 lg('LedBasic IDE v3','o');
 lg('Ctrl+Enter — Запуск  |  Ctrl+S — Сохранить  |  F5 — Запуск','i');

@@ -230,3 +230,84 @@ button{cursor:pointer;font-family:inherit;border:none;outline:none}
 #notif.vis{transform:translateX(0)}
 #notif.ok{border-color:var(--gr);color:var(--gr)}
 #notif.err{border-color:var(--re);color:var(--re)}
+
+/* ── EXAMPLES DROPDOWN ── */
+.tbdrop{position:relative}
+.ddcaret{font-size:9px;margin-left:3px;opacity:.6}
+.ddmenu{
+  position:absolute;top:calc(100% + 4px);left:0;
+  background:var(--bg3);border:1px solid var(--br2);border-radius:4px;
+  min-width:240px;max-height:420px;overflow-y:auto;
+  z-index:800;box-shadow:0 8px 24px rgba(0,0,0,.7);
+  display:none;padding:4px 0
+}
+.ddmenu.open{display:block}
+.dditem{
+  padding:7px 14px;font-size:11px;color:var(--t2);cursor:pointer;
+  display:flex;flex-direction:column;gap:2px;
+  border-bottom:1px solid var(--br);transition:background .1s
+}
+.dditem:last-child{border-bottom:none}
+.dditem:hover{background:var(--bg4);color:var(--t1)}
+.dditem-name{font-weight:700;color:var(--ac);font-size:11px}
+.dditem-desc{font-size:10px;color:var(--t3);font-family:'Rajdhani',sans-serif}
+.ddcat{
+  padding:5px 14px 3px;font-size:9px;color:var(--t3);
+  letter-spacing:2px;text-transform:uppercase;
+  font-family:'Rajdhani',sans-serif;font-weight:600;
+  background:var(--bg2);border-bottom:1px solid var(--br)
+}
+
+/* ── REFERENCE MODAL ── */
+/* modal-wide: справочник — шире и с flex-колонкой для скролла */
+.modal-wide{
+  min-width:720px;max-width:860px;
+  max-height:88vh;
+  display:flex;flex-direction:column;
+}
+/* переопределяем display у modal когда он открыт через JS */
+.modal-wide[style*="display: flex"],
+.modal-wide[style*="display:flex"]{ display:flex!important; }
+.ref-tabs{display:flex;gap:2px}
+.ref-tab{
+  padding:3px 10px;font-size:10px;border-radius:3px;cursor:pointer;
+  background:var(--bg3);color:var(--t2);border:1px solid var(--br);
+  font-family:'Rajdhani',sans-serif;font-weight:600;letter-spacing:.5px;
+  transition:all .1s;white-space:nowrap
+}
+.ref-tab:hover{color:var(--t1)}
+.ref-tab.on{background:var(--ac3);border-color:var(--ac2);color:var(--ac)}
+.ref-page{display:none;padding:16px 20px}
+.ref-page.on{display:block}
+.ref-section{margin-bottom:20px}
+.ref-section-title{
+  font-family:'Rajdhani',sans-serif;font-size:13px;font-weight:700;
+  color:var(--ac);letter-spacing:1px;text-transform:uppercase;
+  padding-bottom:6px;border-bottom:1px solid var(--br);margin-bottom:10px
+}
+.ref-table{width:100%;border-collapse:collapse;font-size:11px}
+.ref-table th{
+  text-align:left;padding:5px 10px;background:var(--bg2);
+  color:var(--t2);font-weight:600;font-family:'Rajdhani',sans-serif;
+  font-size:10px;letter-spacing:.5px;border-bottom:1px solid var(--br)
+}
+.ref-table td{padding:5px 10px;border-bottom:1px solid var(--br);color:var(--t1);vertical-align:top}
+.ref-table tr:last-child td{border-bottom:none}
+.ref-table tr:hover td{background:rgba(0,212,255,.04)}
+.ref-table td:first-child{font-family:'Courier New',monospace;color:var(--ac);white-space:nowrap}
+.ref-table td:nth-child(2){color:var(--ye);font-family:'Courier New',monospace;white-space:nowrap}
+.ref-example{
+  background:var(--bg);border:1px solid var(--br);border-radius:3px;
+  padding:8px 12px;font-size:11px;font-family:'Courier New',monospace;
+  color:var(--t2);margin-top:6px;line-height:1.7;white-space:pre-wrap
+}
+.ref-note{
+  font-size:10px;color:var(--gr);font-style:italic;
+  padding:6px 10px;background:rgba(61,255,122,.06);
+  border-left:2px solid var(--gr);border-radius:0 3px 3px 0;margin-top:8px
+}
+.ref-warn{
+  font-size:10px;color:var(--ye);
+  padding:6px 10px;background:rgba(255,208,96,.06);
+  border-left:2px solid var(--ye);border-radius:0 3px 3px 0;margin-top:8px
+}
